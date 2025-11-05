@@ -2,100 +2,61 @@
 
 Girder plugin to import a BIDS database
 
-## 1. Setup
 
-### Ubuntu 22.04:
+## 1. Import BIDS database
+
+**IMPORTANTE**: Attiva l'environment conda prima di eseguire i comandi:
 ```bash
-pip install girder girder-client fire bids-validator-deno
+conda activate girderbids
 ```
 
-### MacOS
+### Opzione 1: Confronta contenuto (senza upload)
 ```bash
-curl -fsSL https://deno.land/install.sh | sh
-deno compile -ERWN -o bids-validator jsr:@bids/validator
-pip install girder girder-client fire
+./compare-content.sh
 ```
+Mostra quali file sono già presenti su Girder e quali sono nuovi.
 
-### Windows
-Not currently supported.
-
-## 2. Build girder front
-
-### Ubuntu 22.04
-
+### Opzione 2: Carica solo file nuovi (skip existing)
 ```bash
-girder build
+./run-importer-skip-existing.sh
 ```
+Carica solo i file che non sono già presenti su Girder (consigliato per aggiornamenti incrementali).
 
-### MacOS
-Install npm using Homebrew : 
+### Opzione 3: Carica tutti i file
 ```bash
-brew install node
+./run-importer.sh
 ```
-Add the following environment variable:
+Carica tutti i file, sovrascrivendo quelli esistenti.
+
+### Opzione 4: Comando manuale completo
 ```bash
-export NODE_OPTIONS=--openssl-legacy-provider
+python3 tools/bids-importer.py \
+    --bids-dir /path/to/bids \
+    --api-url http://localhost:8081/api/v1 \
+    --api-key YOUR_API_KEY \
+    --folder-id FOLDER_ID \
+    [--compare | --skip-existing | --reset] \
+    [--no-validate] \
+    [--verbose]
 ```
 
-```bash
-girder build
+### Flag disponibili:
+- `--compare`: Confronta locale vs Girder senza caricare (dry-run)
+- `--skip-existing`: Salta i file già presenti (upload incrementale)
+- `--reset`: Elimina tutto prima di caricare (ricomincia da zero)
+- `--no-validate`: Salta la validazione BIDS
+- `--verbose`: Output dettagliato
+
+### Funzionalità principali:
+- **Combinazione NIfTI + JSON**: File `.nii.gz` e `.json` con stesso nome vengono combinati in un unico item
+- **Confronto intelligente**: Identifica file nuovi, esistenti e modificati
+- **Upload incrementale**: Con `--skip-existing` carica solo ciò che manca
+- **Gestione folder esistenti**: Riutilizza folder già create invece di generare errori
+
+### Esempio output confronto:
 ```
-
-## 3. Install mongodb
-
-### Ubuntu 22.04
-To set up MongoDB 4.4 on Ubuntu 22.04 execute the following commands :
-
-```bash
-curl -fsSL https://pgp.mongodb.com/server-4.4.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-4.4.gpg --dearmor
-echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-4.4.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/4.4 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-4.4.list
-apt-get update
-wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
-sudo dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb
-apt-get install -y mongodb-org mongo-tools
-sudo systemctl daemon-reload
-systemctl start mongod
-systemctl enable mongod
-chown mongodb:mongodb /var/log/mongodb/mongod.log
-chown -R mongodb:mongodb /var/lib/mongodb/*
+📁 FILE NUOVI (da caricare): 18025
+✓ FILE GIÀ PRESENTI (identici): 827
+⚠️  FILE MODIFICATI (size diversa): 1
+TOTALE file locali: 18853
 ```
-
-### MacOS
-Add MongoDB 4.4:
-```bash
-brew tap mongodb/brew
-brew install mongodb-community@4.4
-brew services start mongodb-community@4.4
-```
-
-## 3. Serve girder
-
-```bash
-girder serve
-```
-
-You can specify a database other than "girder" by creating a girder.cfg with following content:
-
-```
-[database]
-uri = "mongodb://localhost:27017/hint"
-```
-
-And serve girder with GIRDER_CONFIG env variable:
-
-```
-GIRDER_CONFIG=./girder.cfg girder serve
-```
-
-## 4. Create admin account with "Register" on localhost:8080
-## 5. Login and create API key
-## 6. Create assetstore on localhost:8080
-## 7. Create a Collection and a Folder in the collection, copy the ID of the created Folder
-
-## 8. Import BIDS database
-
-```bash
-python tools/bids-importer.py  --bids_dir ... --girder_api_url http://localhost:8080/api/v1  --girder_api_key ... --girder_folder_id ...
-```
-
-If you want to ignore the validation step, pass `--ignore_validation` on the command-line.
