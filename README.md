@@ -53,10 +53,8 @@ python3 tools/bids-importer.py \
 - **Upload incrementale**: Con `--skip-existing` carica solo ciò che manca
 - **Gestione folder esistenti**: Riutilizza folder già create invece di generare errori
 
-### Esempio output confronto:
-```
-📁 FILE NUOVI (da caricare): 18025
-✓ FILE GIÀ PRESENTI (identici): 827
-⚠️  FILE MODIFICATI (size diversa): 1
-TOTALE file locali: 18853
-```
+
+### TODO
+
+- Aggiungere controllo sul parsing dei nifti. Andare ad aggiornare il plugin facendo in modo che se rileva un cambiamento o altro upload provveda ad aggiornare i metadati.
+
