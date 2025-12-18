@@ -51,7 +51,7 @@ def validate_bids(directory):
         return False
 
 
-def check_girder_connection(api_url):
+def check_girder_connection(api_url, verify_ssl=True, cert_path=None):
     """Verifica se l'istanza Girder è raggiungibile."""
     try:
         parsed = urlparse(api_url)
@@ -59,13 +59,22 @@ def check_girder_connection(api_url):
             api_url = 'http://' + api_url
             parsed = urlparse(api_url)
         base_url = parsed.scheme + '://' + parsed.netloc
-        response = requests.get(base_url, timeout=10)
+
+        # Determina parametro verify per requests
+        verify_param = cert_path if cert_path else verify_ssl
+
+        response = requests.get(base_url, timeout=10, verify=verify_param)
         if response.status_code == 200:
             logger.info("Girder connection successful.")
             return True
         else:
             logger.error(f"Connection failed with status {response.status_code}")
             return False
+    except requests.exceptions.SSLError as e:
+        logger.error(f"SSL certificate verification failed: {e}")
+        logger.error("SUGGERIMENTO: Usa --no-ssl-verify per disabilitare la verifica SSL")
+        logger.error("            o --certificate /path/to/cert.pem per usare un certificato personalizzato")
+        return False
     except Exception as e:
         logger.error(f"Connection failed: {e}")
         return False
@@ -350,25 +359,31 @@ def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='
         try:
             if 'nifti' in file_group and 'json' in file_group:
                 # Caso BIDS: NIfTI + JSON → crea un unico item
-                logger.info(f"Uploading BIDS pair: {os.path.basename(file_group['nifti'])} + {os.path.basename(file_group['json'])}")
-                
-                item_name = os.path.basename(file_group['nifti'])
-                
+                nifti_name = os.path.basename(file_group['nifti'])
+                json_name = os.path.basename(file_group['json'])
+
+                logger.info(f"Uploading BIDS pair: {nifti_name} + {json_name}")
+
+                item_name = nifti_name
+
                 # CORREZIONE: Usa folderId per folder, parentType+parentId per collection
                 if parent_type == 'folder':
                     item_data = {'folderId': girder_parent_id, 'name': item_name}
                 else:  # collection
                     item_data = {'parentType': parent_type, 'parentId': girder_parent_id, 'name': item_name}
-                
+
                 item = gc.post('item', data=item_data)
-                
-                # Upload NIfTI file nell'item
-                gc.uploadFileToItem(item['_id'], file_group['nifti'])
-                
-                # Upload JSON file nello stesso item
+                logger.info(f"  Created item '{item_name}' (ID: {item['_id']})")
+
+                # IMPORTANTE: Caricare JSON PRIMA del NIfTI per garantire che eventuali
+                # plugin Girder che si attivano automaticamente trovino i metadati
+                logger.info(f"  Uploading JSON metadata first: {json_name}")
                 gc.uploadFileToItem(item['_id'], file_group['json'])
-                
-                logger.info(f"  ✓ Created item '{item_name}' with NIfTI + JSON")
+
+                logger.info(f"  Uploading NIfTI file: {nifti_name}")
+                gc.uploadFileToItem(item['_id'], file_group['nifti'])
+
+                logger.info(f"  ✓ Successfully uploaded pair to item '{item_name}'")
                 
             elif 'nifti' in file_group:
                 # Solo NIfTI senza JSON
@@ -435,52 +450,100 @@ def is_bids_item(item):
 def get_associated_id(gc, parent_id, bids_item):
     """Trova l'ID associato a un file JSON BIDS."""
     file_name = bids_item['name']
+
+    # Special case: dataset_description.json si applica alla folder
     if file_name == 'dataset_description.json':
         return parent_id, 'folder'
-    file_base, _ = os.path.splitext(file_name)
+
+    # Rimuovi estensione .json
+    file_base, _ = os.path.splitext(file_name)  # es: "sub-01_T1w.json" → "sub-01_T1w"
+
+    # Cerca item con nome che corrisponde esattamente al base name con estensioni NIfTI
     for item in gc.listItem(parent_id):
-        if item['name'].startswith(file_base):
+        item_name = item['name']
+
+        # Match esatto: sub-01_T1w.nii.gz o sub-01_T1w.nii
+        if item_name == f"{file_base}.nii.gz" or item_name == f"{file_base}.nii":
             return item['_id'], 'item'
+
+        # Fallback: usa il matching originale (startswith) per compatibilità
+        # ma logga un warning
+        if item_name.startswith(file_base):
+            logger.debug(f"Loose match for {file_name}: found item {item_name}")
+            return item['_id'], 'item'
+
     return (None, None)
 
 
 def extract_bids_metadata(gc, folder_id, recursive=True):
     """Estrae metadati da file JSON BIDS e li assegna agli item in Girder."""
+    metadata_success_count = 0
+    metadata_fail_count = 0
+
     for item in gc.listItem(folder_id):
         if is_bids_item(item):
+            json_name = item['name']
+            logger.info(f"Processing JSON file: {json_name}")
+
             associated_id, assoc_type = get_associated_id(gc, folder_id, item)
             if associated_id is None:
-                logger.debug(f"No associated resource for {item['name']}")
+                logger.warning(f"  No associated resource found for {json_name}")
+                metadata_fail_count += 1
                 continue
-            bids_file = next(gc.listFile(item['_id'], limit=1))
-            file_obj = io.BytesIO()
-            for chunk in gc.downloadFileAsIterator(bids_file['_id']):
-                if chunk:
-                    file_obj.write(chunk)
-            metadata = get_file_metadata(file_obj)
+
+            # Download e parse JSON
+            try:
+                bids_file = next(gc.listFile(item['_id'], limit=1))
+                file_obj = io.BytesIO()
+                for chunk in gc.downloadFileAsIterator(bids_file['_id']):
+                    if chunk:
+                        file_obj.write(chunk)
+                metadata = get_file_metadata(file_obj)
+
+                logger.info(f"  Parsed {len(metadata)} metadata fields from {json_name}")
+            except Exception as e:
+                logger.error(f"  Failed to parse JSON {json_name}: {e}")
+                metadata_fail_count += 1
+                continue
+
+            # Applica metadati
             try:
                 if assoc_type == 'item':
                     gc.addMetadataToItem(associated_id, metadata)
+                    logger.info(f"  Applied metadata to item (ID: {associated_id})")
                 elif assoc_type == 'folder':
                     gc.addMetadataToFolder(associated_id, metadata)
-            except Exception as e:
-                logger.warning(f"Failed to add metadata: {e}")
+                    logger.info(f"  Applied metadata to folder (ID: {associated_id})")
 
+                metadata_success_count += 1
+
+            except Exception as e:
+                logger.error(f"  Failed to add metadata from {json_name}: {e}")
+                metadata_fail_count += 1
+
+    # Logging riepilogo
+    if metadata_success_count > 0 or metadata_fail_count > 0:
+        logger.info(f"Metadata extraction summary: {metadata_success_count} successful, {metadata_fail_count} failed")
+
+    # Ricorsione
     if recursive:
         for child_folder in gc.listFolder(folder_id):
             extract_bids_metadata(gc, child_folder['_id'])
 
 
-def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode, skip_files=None):
+def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode,
+                     skip_files=None, verify_ssl=True, cert_path=None):
     """
     Carica i file BIDS su Girder preservando la gerarchia.
-    
+
     Args:
         skip_files: Set di percorsi relativi da saltare durante l'upload
+        verify_ssl: Se False, disabilita verifica certificato SSL
+        cert_path: Percorso a certificato CA personalizzato (opzionale)
     """
     if skip_files is None:
         skip_files = set()
-    
+
     parsed = urlparse(api_url)
     if not parsed.scheme:
         api_url = 'http://' + api_url
@@ -488,13 +551,32 @@ def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode, s
 
     base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
 
-    if not check_girder_connection(base_url):
+    # Passa parametri SSL a check_girder_connection
+    if not check_girder_connection(base_url, verify_ssl, cert_path):
         logger.error("Cannot connect to Girder. Aborting.")
         return False
 
     try:
         gc = girder_client.GirderClient(apiUrl=api_url)
+
+        # WORKAROUND: GirderClient non espone parametri SSL nel costruttore
+        # Creiamo manualmente la sessione con la configurazione SSL corretta
+        verify_param = cert_path if cert_path else verify_ssl
+
+        # Creiamo una nuova sessione requests con SSL configurato
+        import requests
+        session = requests.Session()
+        session.verify = verify_param
+
+        # Assegniamo la sessione configurata al client Girder
+        gc._session = session
+
         gc.authenticate(apiKey=api_key)
+    except requests.exceptions.SSLError as e:
+        logger.error(f"SSL certificate verification failed during authentication: {e}")
+        logger.error("SUGGERIMENTO: Usa --no-ssl-verify per disabilitare la verifica SSL")
+        logger.error("            o --certificate /path/to/cert.pem per usare un certificato personalizzato")
+        return False
     except Exception as e:
         logger.error(f"Failed to authenticate: {e}")
         return False
@@ -523,8 +605,10 @@ def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode, s
     try:
         logger.info("Extracting BIDS metadata...")
         extract_bids_metadata(gc, root_folder_id)
+        logger.info("Metadata extraction completed")
     except Exception as e:
         logger.warning(f"extract_bids_metadata failed: {e}")
+        logger.warning("Some metadata may not have been applied")
 
     logger.info("Upload complete!")
     return True
@@ -593,13 +677,30 @@ Esempi:
         action='store_true',
         help='Salta il caricamento dei file già presenti su Girder'
     )
-    
+    parser.add_argument(
+        '--no-ssl-verify',
+        action='store_true',
+        help='Disabilita la verifica del certificato SSL (utile per certificati self-signed)'
+    )
+    parser.add_argument(
+        '--certificate',
+        type=str,
+        default=None,
+        help='Percorso al file certificato CA personalizzato (.pem)'
+    )
+
     args = parser.parse_args()
-    
+
     # Imposta livello logging
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
+    # Warning sicurezza SSL
+    if args.no_ssl_verify:
+        logger.warning("⚠️  SSL certificate verification is DISABLED")
+        logger.warning("   This makes the connection vulnerable to man-in-the-middle attacks")
+        logger.warning("   Use only in trusted networks or with --certificate option")
+
     # Determina import mode
     import_mode = ImportMode.RESET_DATABASE if args.reset else ImportMode.OVERWRITE_ON_SAME_NAME
     
@@ -617,24 +718,36 @@ Esempi:
     # Modalità compare: solo confronto senza upload
     if args.compare:
         logger.info("Compare mode: checking existing content...")
-        
+
+        # Determina parametri SSL
+        verify_ssl = not args.no_ssl_verify
+        cert_path = args.certificate
+        verify_param = cert_path if cert_path else verify_ssl
+
         # Connessione a Girder
         try:
             from urllib.parse import urlparse, urlunparse
-            
+
             parsed = urlparse(args.api_url)
             if not parsed.scheme:
                 parsed = urlparse(f"http://{args.api_url}")
-            
+
             base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
-            
-            if not check_girder_connection(base_url):
+
+            if not check_girder_connection(base_url, verify_ssl, cert_path):
                 logger.error("Cannot connect to Girder. Aborting.")
                 return 1
-            
+
             gc = girder_client.GirderClient(apiUrl=args.api_url)
+
+            # Applica configurazione SSL
+            import requests
+            session = requests.Session()
+            session.verify = verify_param
+            gc._session = session
+
             gc.authenticate(apiKey=args.api_key)
-            
+
             # Verifica folder
             folder_info = gc.getFolder(args.folder_id)
             logger.info(f"Target folder: {folder_info['name']} ({args.folder_id})")
@@ -660,20 +773,32 @@ Esempi:
     if args.skip_existing:
         try:
             from urllib.parse import urlparse, urlunparse
-            
+
+            # Determina parametri SSL
+            verify_ssl = not args.no_ssl_verify
+            cert_path = args.certificate
+            verify_param = cert_path if cert_path else verify_ssl
+
             parsed = urlparse(args.api_url)
             if not parsed.scheme:
                 parsed = urlparse(f"http://{args.api_url}")
-            
+
             base_url = urlunparse((parsed.scheme, parsed.netloc, '', '', '', ''))
-            
-            if not check_girder_connection(base_url):
+
+            if not check_girder_connection(base_url, verify_ssl, cert_path):
                 logger.error("Cannot connect to Girder. Aborting.")
                 return 1
-            
+
             gc = girder_client.GirderClient(apiUrl=args.api_url)
+
+            # Applica configurazione SSL
+            import requests
+            session = requests.Session()
+            session.verify = verify_param
+            gc._session = session
+
             gc.authenticate(apiKey=args.api_key)
-            
+
             logger.info("Checking existing content to skip...")
             comparison, local_files = check_existing_content(gc, args.folder_id, args.bids_dir)
             
@@ -691,16 +816,22 @@ Esempi:
             logger.error(f"Could not check existing content: {e}")
             logger.error("Aborting upload due to --skip-existing check failure")
             return 1
-    
+
+    # Determina parametri SSL
+    verify_ssl = not args.no_ssl_verify
+    cert_path = args.certificate
+
     success = upload_to_girder(
         args.api_url,
         args.api_key,
         args.folder_id,
         args.bids_dir,
         import_mode,
-        skip_files
+        skip_files,
+        verify_ssl,
+        cert_path
     )
-    
+
     return 0 if success else 1
 
 

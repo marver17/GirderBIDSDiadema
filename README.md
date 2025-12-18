@@ -37,7 +37,8 @@ python3 tools/bids-importer.py \
     --folder-id FOLDER_ID \
     [--compare | --skip-existing | --reset] \
     [--no-validate] \
-    [--verbose]
+    [--verbose] \
+    [--no-ssl-verify | --certificate /path/to/cert.pem]
 ```
 
 ### Flag disponibili:
@@ -46,15 +47,39 @@ python3 tools/bids-importer.py \
 - `--reset`: Elimina tutto prima di caricare (ricomincia da zero)
 - `--no-validate`: Salta la validazione BIDS
 - `--verbose`: Output dettagliato
+- `--no-ssl-verify`: Disabilita verifica certificato SSL (utile per certificati self-signed)
+- `--certificate /path/to/cert.pem`: Usa un certificato CA personalizzato
 
 ### Funzionalità principali:
 - **Combinazione NIfTI + JSON**: File `.nii.gz` e `.json` con stesso nome vengono combinati in un unico item
 - **Confronto intelligente**: Identifica file nuovi, esistenti e modificati
 - **Upload incrementale**: Con `--skip-existing` carica solo ciò che manca
 - **Gestione folder esistenti**: Riutilizza folder già create invece di generare errori
+- **Supporto SSL/TLS**: Gestione certificati self-signed e CA personalizzati
 
+### Gestione Certificati SSL
 
-### TODO
+#### Caso 1: Server con certificato self-signed
+Se il server Girder usa un certificato self-signed, puoi disabilitare la verifica SSL:
+```bash
+python3 tools/bids-importer.py \
+    --bids-dir /mnt/diadema/BIDSsample \
+    --api-url https://girder.com \
+    --api-key YOUR_API_KEY \
+    --folder-id FOLDER_ID \
+    --no-ssl-verify \
+    --no-validate
+```
 
-- Aggiungere controllo sul parsing dei nifti. Andare ad aggiornare il plugin facendo in modo che se rileva un cambiamento o altro upload provveda ad aggiornare i metadati.
+#### Caso 2: Server con certificato CA personalizzato
+Per una connessione più sicura, usa un certificato CA personalizzato:
+```bash
+python3 tools/bids-importer.py \
+    --bids-dir /mnt/diadema/BIDSsample \
+    --api-url https://girder.com \
+    --api-key YOUR_API_KEY \
+    --folder-id FOLDER_ID \
+    --certificate /path/to/ca-cert.pem \
+    --no-validate
+```
 
