@@ -16,6 +16,7 @@ from urllib.parse import urlparse, urlunparse
 
 import girder_client
 import requests
+from tqdm import tqdm
 
 # Configurazione logging
 logging.basicConfig(
@@ -299,7 +300,26 @@ def check_existing_content(gc, folder_id, bids_root):
     return comparison, local_files
 
 
-def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='folder', skip_files=None, bids_root=None):
+def maybe_tqdm(iterable, desc=None, total=None, disable=False):
+    """
+    Wrapper per tqdm che può essere disabilitato.
+
+    Args:
+        iterable: Iterabile da wrappare
+        desc: Descrizione per la progress bar
+        total: Numero totale di elementi (se noto)
+        disable: Se True, non mostra progress bar
+
+    Returns:
+        Iterator wrappato con tqdm o l'iterabile originale
+    """
+    if disable:
+        return iterable
+
+    return tqdm(iterable, desc=desc, total=total, unit='file', leave=False)
+
+
+def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='folder', skip_files=None, bids_root=None, show_progress=True):
     """
     Upload ricorsivo di una directory su Girder, combinando NIfTI + JSON in un unico item.
     
@@ -323,12 +343,7 @@ def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='
         if os.path.isfile(local_item):
             # Calcola percorso relativo dalla BIDS root
             rel_path = os.path.relpath(local_item, bids_root)
-            
-            # Verifica se questo file deve essere saltato
-            if rel_path in skip_files:
-                logger.debug(f"Skipping existing file: {rel_path}")
-                continue
-            
+
             # Estrai nome base e estensione
             name_base = item
             if item.endswith('.nii.gz'):
@@ -339,26 +354,49 @@ def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='
                 name_base = item[:-5]
             else:
                 name_base = os.path.splitext(item)[0]
-            
+
             # Raggruppa per nome base
             if name_base not in files:
                 files[name_base] = {}
-            
+
             if item.endswith('.nii.gz') or item.endswith('.nii'):
                 files[name_base]['nifti'] = local_item
+                files[name_base]['nifti_rel'] = rel_path
             elif item.endswith('.json'):
                 files[name_base]['json'] = local_item
+                files[name_base]['json_rel'] = rel_path
             else:
                 files[name_base]['other'] = local_item
+                files[name_base]['other_rel'] = rel_path
         
         elif os.path.isdir(local_item):
             dirs.append((item, local_item))
     
     # Upload dei file
-    for name_base, file_group in files.items():
+    file_items = list(files.items())
+    for name_base, file_group in maybe_tqdm(
+        file_items,
+        desc=f"Uploading to {os.path.basename(local_path) or 'root'}",
+        total=len(file_items),
+        disable=not show_progress
+    ):
         try:
             if 'nifti' in file_group and 'json' in file_group:
                 # Caso BIDS: NIfTI + JSON → crea un unico item
+                nifti_skipped = file_group.get('nifti_rel') in skip_files
+                json_skipped = file_group.get('json_rel') in skip_files
+
+                # Se ENTRAMBI sono già presenti, skippa la coppia intera
+                if nifti_skipped and json_skipped:
+                    logger.debug(f"Skipping existing pair: {name_base}")
+                    continue
+
+                # Se UNO dei due esiste già, skippa comunque (non creare item parziali)
+                if nifti_skipped or json_skipped:
+                    logger.debug(f"Skipping pair {name_base} (partial match on Girder)")
+                    continue
+
+                # Entrambi sono nuovi → carica la coppia
                 nifti_name = os.path.basename(file_group['nifti'])
                 json_name = os.path.basename(file_group['json'])
 
@@ -387,16 +425,34 @@ def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='
                 
             elif 'nifti' in file_group:
                 # Solo NIfTI senza JSON
+                nifti_skipped = file_group.get('nifti_rel') in skip_files
+
+                if nifti_skipped:
+                    logger.debug(f"Skipping existing NIfTI: {name_base}")
+                    continue
+
                 logger.info(f"Uploading NIfTI (no JSON): {os.path.basename(file_group['nifti'])}")
                 gc.upload(file_group['nifti'], girder_parent_id, parentType=parent_type)
                 
             elif 'json' in file_group:
                 # Solo JSON senza NIfTI (es. dataset_description.json)
+                json_skipped = file_group.get('json_rel') in skip_files
+
+                if json_skipped:
+                    logger.debug(f"Skipping existing JSON: {name_base}")
+                    continue
+
                 logger.info(f"Uploading JSON: {os.path.basename(file_group['json'])}")
                 gc.upload(file_group['json'], girder_parent_id, parentType=parent_type)
                 
             elif 'other' in file_group:
                 # Altri file (tsv, txt, ecc.)
+                other_skipped = file_group.get('other_rel') in skip_files
+
+                if other_skipped:
+                    logger.debug(f"Skipping existing file: {name_base}")
+                    continue
+
                 logger.info(f"Uploading file: {os.path.basename(file_group['other'])}")
                 gc.upload(file_group['other'], girder_parent_id, parentType=parent_type)
                 
@@ -431,7 +487,7 @@ def upload_directory_recursively(gc, local_path, girder_parent_id, parent_type='
         
         # Ricorsione con propagazione skip_files e bids_root
         try:
-            upload_directory_recursively(gc, dir_path, folder_id, 'folder', skip_files, bids_root)
+            upload_directory_recursively(gc, dir_path, folder_id, 'folder', skip_files, bids_root, show_progress)
         except Exception as e:
             logger.warning(f"Failed to upload contents of {dir_name}: {e}")
 
@@ -532,7 +588,7 @@ def extract_bids_metadata(gc, folder_id, recursive=True):
 
 
 def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode,
-                     skip_files=None, verify_ssl=True, cert_path=None):
+                     skip_files=None, verify_ssl=True, cert_path=None, show_progress=True):
     """
     Carica i file BIDS su Girder preservando la gerarchia.
 
@@ -540,6 +596,7 @@ def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode,
         skip_files: Set di percorsi relativi da saltare durante l'upload
         verify_ssl: Se False, disabilita verifica certificato SSL
         cert_path: Percorso a certificato CA personalizzato (opzionale)
+        show_progress: Se True, mostra progress bar durante l'upload
     """
     if skip_files is None:
         skip_files = set()
@@ -597,7 +654,7 @@ def upload_to_girder(api_url, api_key, root_folder_id, bids_root, import_mode,
         logger.info(f"Uploading BIDS dataset from {bids_root} to folder {root_folder_id}")
         if skip_files:
             logger.info(f"Skipping {len(skip_files)} existing files")
-        upload_directory_recursively(gc, bids_root, root_folder_id, 'folder', skip_files, bids_root)
+        upload_directory_recursively(gc, bids_root, root_folder_id, 'folder', skip_files, bids_root, show_progress)
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         return False
@@ -688,15 +745,34 @@ Esempi:
         default=None,
         help='Percorso al file certificato CA personalizzato (.pem)'
     )
+    parser.add_argument(
+        '--quiet',
+        action='store_true',
+        help='Mostra solo warning ed errori (riduce output)'
+    )
+    parser.add_argument(
+        '--no-progress',
+        action='store_true',
+        help='Disabilita le progress bar durante l\'upload'
+    )
 
     args = parser.parse_args()
 
-    # Imposta livello logging
-    if args.verbose:
+    # Configurazione livello logging
+    if args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(logging.INFO)  # Default
 
-    # Warning sicurezza SSL
+    # Gestione warning SSL urllib3
     if args.no_ssl_verify:
+        # Sopprimi automaticamente i warning SSL di urllib3
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # Mostra warning di sicurezza all'utente
         logger.warning("⚠️  SSL certificate verification is DISABLED")
         logger.warning("   This makes the connection vulnerable to man-in-the-middle attacks")
         logger.warning("   Use only in trusted networks or with --certificate option")
@@ -821,6 +897,9 @@ Esempi:
     verify_ssl = not args.no_ssl_verify
     cert_path = args.certificate
 
+    # Determina se mostrare progress bar
+    show_progress = not args.no_progress
+
     success = upload_to_girder(
         args.api_url,
         args.api_key,
@@ -829,7 +908,8 @@ Esempi:
         import_mode,
         skip_files,
         verify_ssl,
-        cert_path
+        cert_path,
+        show_progress
     )
 
     return 0 if success else 1

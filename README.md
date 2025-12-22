@@ -46,7 +46,9 @@ python3 tools/bids-importer.py \
 - `--skip-existing`: Salta i file già presenti (upload incrementale)
 - `--reset`: Elimina tutto prima di caricare (ricomincia da zero)
 - `--no-validate`: Salta la validazione BIDS
-- `--verbose`: Output dettagliato
+- `--verbose`: Output dettagliato (livello DEBUG)
+- `--quiet`: Mostra solo warning ed errori (riduce output)
+- `--no-progress`: Disabilita le progress bar durante l'upload
 - `--no-ssl-verify`: Disabilita verifica certificato SSL (utile per certificati self-signed)
 - `--certificate /path/to/cert.pem`: Usa un certificato CA personalizzato
 
@@ -83,3 +85,12 @@ python3 tools/bids-importer.py \
     --no-validate
 ```
 
+## Funzionalità Implementate
+
+- ✅ SSL/TLS support con certificati self-signed e CA personalizzati
+- ✅ Upload metadati JSON prima dei file NIfTI
+- ✅ Fix creazione item duplicati con --skip-existing
+- ✅ Flag --quiet per ridurre output (solo WARNING/ERROR)
+- ✅ Progress bar con tqdm per monitorare upload
+- ✅ Flag --no-progress per disabilitare progress bar
+- ✅ Soppressione automatica warning SSL urllib3 con --no-ssl-verify
